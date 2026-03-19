@@ -12,6 +12,13 @@ const AGENT = `claude-code/${VERSION}`;
 const SALT = "59cf53e54c78";
 const ENTRY = "CLAUDE_CODE_ENTRYPOINT";
 const PROMPT = new URL("./anthropic-prompt.txt", import.meta.url);
+const PLATFORM_HOST = "platform.claude.com";
+const LEGACY_CONSOLE_HOST = "console.anthropic.com";
+const CALLBACK_URL = `https://${PLATFORM_HOST}/oauth/code/callback`;
+const TOKEN_ENDPOINTS = [
+  `https://${PLATFORM_HOST}/v1/oauth/token`,
+  `https://${LEGACY_CONSOLE_HOST}/v1/oauth/token`,
+];
 
 async function prompt() {
   const file = Bun.file(PROMPT);
@@ -53,6 +60,59 @@ function authHeaders(extra = {}) {
   };
 }
 
+async function parseError(response) {
+  const text = await response.text();
+  try {
+    const json = JSON.parse(text);
+    return json?.error_description || json?.error?.message || text;
+  } catch {
+    return text || response.statusText;
+  }
+}
+
+async function exchangeWithEndpoint(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    return {
+      ok: false,
+      endpoint: url,
+      status: res.status,
+      message: await parseError(res),
+    };
+  }
+
+  return {
+    ok: true,
+    endpoint: url,
+    json: await res.json(),
+  };
+}
+
+function normalizeCodeInput(input) {
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("http://") && !trimmed.startsWith("https://")) {
+    return trimmed;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    const code = url.searchParams.get("code");
+    const state =
+      url.searchParams.get("state") ||
+      url.hash.replace(/^#/, "") ||
+      url.searchParams.get("code_verifier");
+    if (code) return `${code}#${state || ""}`;
+    return trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
 function text(input) {
   if (!Array.isArray(input)) return "";
 
@@ -91,14 +151,14 @@ function billing(body) {
 async function authorize(mode) {
   const code = await pkce();
   const url = new URL(
-    `https://${mode === "console" ? "console.anthropic.com" : "claude.ai"}/oauth/authorize`,
+    `https://${mode === "console" ? PLATFORM_HOST : "claude.ai"}/oauth/authorize`,
   );
   url.searchParams.set("code", "true");
   url.searchParams.set("client_id", CLIENT_ID);
   url.searchParams.set("response_type", "code");
   url.searchParams.set(
     "redirect_uri",
-    "https://console.anthropic.com/oauth/code/callback",
+    CALLBACK_URL,
   );
   url.searchParams.set(
     "scope",
@@ -114,28 +174,37 @@ async function authorize(mode) {
 }
 
 async function exchange(code, verifier) {
-  const split = code.split("#");
-  const res = await fetch("https://console.anthropic.com/v1/oauth/token", {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({
-      code: split[0],
-      state: split[1],
-      grant_type: "authorization_code",
-      client_id: CLIENT_ID,
-      redirect_uri: "https://console.anthropic.com/oauth/code/callback",
-      code_verifier: verifier,
-    }),
-  });
+  const split = normalizeCodeInput(code).split("#");
+  const payload = {
+    code: split[0],
+    state: split[1],
+    grant_type: "authorization_code",
+    client_id: CLIENT_ID,
+    redirect_uri: CALLBACK_URL,
+    code_verifier: verifier,
+  };
 
-  if (!res.ok) return { type: "failed" };
+  let failure = null;
+  for (const endpoint of TOKEN_ENDPOINTS) {
+    const res = await exchangeWithEndpoint(endpoint, payload);
+    if (res.ok) {
+      const json = res.json;
+      return {
+        type: "success",
+        refresh: json.refresh_token,
+        access: json.access_token,
+        expires: Date.now() + json.expires_in * 1000,
+      };
+    }
+    failure = res;
+  }
 
-  const json = await res.json();
   return {
-    type: "success",
-    refresh: json.refresh_token,
-    access: json.access_token,
-    expires: Date.now() + json.expires_in * 1000,
+    type: "failed",
+    error:
+      failure?.message || "Token exchange failed during Anthropic OAuth login.",
+    status: failure?.status,
+    endpoint: failure?.endpoint,
   };
 }
 
@@ -169,42 +238,48 @@ export async function AnthropicAuthPlugin({ client }) {
             if (auth.type !== "oauth") return fetch(input, init);
 
             if (!auth.access || auth.expires < Date.now()) {
-              const res = await fetch(
-                "https://console.anthropic.com/v1/oauth/token",
-                {
-                  method: "POST",
-                  headers: authHeaders(),
-                  body: JSON.stringify({
-                    grant_type: "refresh_token",
-                    refresh_token: auth.refresh,
-                    client_id: CLIENT_ID,
-                  }),
-                },
-              );
+              const payload = {
+                grant_type: "refresh_token",
+                refresh_token: auth.refresh,
+                client_id: CLIENT_ID,
+              };
+              let refreshed = null;
 
-              if (!res.ok)
-                throw new Error(`Token refresh failed: ${res.status}`);
+              for (const endpoint of TOKEN_ENDPOINTS) {
+                const res = await exchangeWithEndpoint(endpoint, payload);
+                if (res.ok) {
+                  refreshed = res.json;
+                  break;
+                }
+              }
 
-              const json = await res.json();
+              if (!refreshed) {
+                throw new Error(
+                  "Token refresh failed on all known Anthropic OAuth endpoints",
+                );
+              }
+
               await client.auth.set({
                 path: { id: "anthropic" },
                 body: {
                   type: "oauth",
-                  refresh: json.refresh_token,
-                  access: json.access_token,
-                  expires: Date.now() + json.expires_in * 1000,
+                  refresh: refreshed.refresh_token,
+                  access: refreshed.access_token,
+                  expires: Date.now() + refreshed.expires_in * 1000,
                 },
               });
-              auth.access = json.access_token;
+              auth.access = refreshed.access_token;
+              auth.refresh = refreshed.refresh_token;
+              auth.expires = Date.now() + refreshed.expires_in * 1000;
             }
 
             const req = init ?? {};
             const headers = new Headers(
               input instanceof Request ? input.headers : undefined,
             );
-            new Headers(req.headers).forEach((value, key) =>
-              headers.set(key, value),
-            );
+            new Headers(req.headers).forEach((value, key) => {
+              headers.set(key, value);
+            });
 
             const beta = headers.get("anthropic-beta") || "";
             const list = beta
