@@ -1,8 +1,18 @@
 {
   "name": "@thehugeman/opencode-anthropic-auth-community",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "main": "./index.mjs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thehugeman/opencode-anthropic-auth-community"
+  },
+  "homepage": "https://github.com/thehugeman/opencode-anthropic-auth-community",
+  "bugs": {
+    "url": "https://github.com/thehugeman/opencode-anthropic-auth-community/issues"
+  },
+  "keywords": ["opencode", "anthropic", "claude", "oauth", "plugin"],
+  "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
   }
